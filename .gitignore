@@ -1,0 +1,27 @@
+# 编译产物
+*.obj
+*.o
+*.lib
+*.exp
+*.pdb
+*.ilk
+obj/
+sk2_zh_new.asi
+sk2_zh.asi
+
+# 游戏数据（版权，绝不入库）
+*.RES
+*.res
+*.SET
+*.dbf
+7K2.exe
+DINPUT.dll
+
+# 日志
+*.log
+
+# 编辑器
+.vs/
+.vscode/
+*.user
+*~
