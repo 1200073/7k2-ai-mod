@@ -59,6 +59,25 @@ constexpr uint32_t RVA_THINK_BUILD_FIRM          = 0x1E7A0;   // VA 0x0041E7A0
 // ai_camp_array / ai_camp_count
 constexpr int OFF_AI_CAMP_ARRAY  = 0x9B9;
 
+// ---- AI 宣战军力门槛（2026-11-14）----
+// 源码依据 oai_dipl.cpp  Nation::think_declare_war()：
+//   过滤循环里有一句  if( nationRelation->ai_relation_level >= 10 ) continue;  // 关系好就不打
+//   ⇒ 不必去 hook 宣战函数本身（外交模块地址已连败三次），
+//     改在 process_ai 里把「够强的邻居」关系等级顶到 10，它就会被原版逻辑自动跳过。
+// 偏移来源：onationb.h 按 #pragma pack(1) 逐成员累加，已用四个反编译锚点交叉校验：
+//   nation_recno=0x04 ✓ / research_tech_id=0x93 ✓ / cash=0x75 ✓ / food=0x79 ✓
+constexpr uint32_t ADDR_UNIT_ARRAY        = 0x0069CAB4;  // unit_array（巢穴探针已实机校验）
+constexpr int      OFF_ARRAY_COUNT        = 0x00C;       // Array::count
+constexpr int      OFF_ARRAY_DATA         = 0x019;       // Array::data（未对齐）
+constexpr int      OFF_UNIT_NATION_RECNO  = 0x00B;       // Unit::nation_recno
+constexpr int      OFF_RELATION_ARRAY     = 0x1B9;       // Nation::relation_array[7]
+constexpr int      MAX_NATION_REAL        = 7;           // gamedef.h MAX_NATION（关系表条数，勿与 SLOTS 混用）
+constexpr int      SIZEOF_NATION_RELATION = 0xF4;        // 244 字节（pack(1) 算得）
+constexpr int      OFF_NATION_COLOR       = 0x00B;       // char nation_color（调色板索引）
+constexpr int      OFF_AI_RELATION_LEVEL  = 0x008;       // NationRelation::ai_relation_level
+constexpr int      OFF_REL_STATUS         = 0x003;       // NationRelation::status（仅用于布局自检）
+constexpr signed char AI_REL_FRIENDLY     = 10;          // ≥10 ⇒ think_declare_war 直接跳过
+
 // ---- 常数 ----
 constexpr int   MONSTER_MINOTAUROS = 4;         // omonsres.h: KHARSHUF=1 ... EXOVUM=7
 constexpr float MINE_SETUP_COST    = 600.0f;    // STD.SET FIRM 表实测（Mine setup_cost）
@@ -595,6 +614,114 @@ static FnProcessAi g_paiOrig = nullptr;
 // 前置声明：E 刀的中立巢穴每日检查（定义在文件后段）
 static void NeutralLairTick();
 
+// ===========================================================================
+// AI 宣战军力门槛（2026-11-14）—— render.ini: aiwar=0 关 / 1 只打日志 / 2 生效
+//
+// 原版缺陷（oai_dipl.cpp: Nation::think_declare_war）：
+//   它只挑「邻居里最弱的那一个」当目标，全程不跟自己比
+//   ⇒ 自己只有对方 1/10 的实力，只要对方是"相对最弱的邻居"照样宣战。
+//
+// 本补丁：数出每国实际单位数（＝实际动员兵力，能体现"爆兵造势"），
+//   凡某个邻居的单位数 ≥ 我方 2 倍，就把他标成"关系好"（ai_relation_level = 10），
+//   原版过滤会自动跳过它 —— 不碰宣战函数本身，复用原版判断。
+//
+// 纪律：只读数组 + 写一个字节字段，不调任何引擎函数（连崩三次后定的方针）。
+// ===========================================================================
+static void ApplyWarGate(void* self)
+{
+    const int mode = ReadIntSwitch("aiwar", 0);
+    if (mode <= 0)
+        return;
+    if (!LooksLikeNation(self))
+        return;
+
+    uint8_t* nat = static_cast<uint8_t*>(self);
+    const int selfNo = *reinterpret_cast<const short*>(nat + OFF_NATION_RECNO);
+    if (selfNo < 1 || selfNo >= MAX_NATION_SLOTS)
+        return;
+
+    // ---- 数每个国家有多少个单位（只读遍历 unit_array）----
+    uint8_t* arr = static_cast<uint8_t*>(G(ADDR_UNIT_ARRAY));
+    if (!InImageRange(arr, OFF_ARRAY_DATA + 4))
+        return;
+    const int total = *reinterpret_cast<const int*>(arr + OFF_ARRAY_COUNT);
+    if (total <= 0 || total > 100000)
+        return;
+    const uint32_t data = *reinterpret_cast<const uint32_t*>(arr + OFF_ARRAY_DATA);
+    if (data < 0x10000)
+        return;
+
+    int cnt[MAX_NATION_SLOTS];
+    for (int k = 0; k < MAX_NATION_SLOTS; ++k)
+        cnt[k] = 0;
+    for (int i = 1; i <= total; ++i) {
+        uint8_t* u = *reinterpret_cast<uint8_t**>(data + (i - 1) * 4);
+        if (!u)
+            continue;
+        const int n = *reinterpret_cast<const char*>(u + OFF_UNIT_NATION_RECNO);
+        if (n >= 1 && n < MAX_NATION_SLOTS)
+            ++cnt[n];
+    }
+
+    const int mine = cnt[selfNo];
+    if (mine <= 0)
+        return;   // 自己一个兵都没有 ⇒ 不参与（避免 ×2 判据失真）
+
+    // 一次性：打印本国编号 / 颜色码 / 种族 / 兵力，
+    // 便于把游戏里看到的"棕色 / 黄色"直接对上国号。
+    static bool introDone[MAX_NATION_SLOTS] = {};
+    if (!introDone[selfNo]) {
+        introDone[selfNo] = true;
+        Log("[AI] 国%d: color=%d race=%d units=%d\r\n", selfNo,
+            static_cast<int>(*reinterpret_cast<const unsigned char*>(nat + OFF_NATION_COLOR)),
+            static_cast<int>(*reinterpret_cast<const signed char*>(nat + OFF_RACE_ID)),
+            mine);
+    }
+
+    const int today = GameDateNow();
+    static int lastLogDay[MAX_NATION_SLOTS][MAX_NATION_SLOTS] = { { 0 } };
+
+    // ★★★ 上界必须是 MAX_NATION(=7)，不能用 MAX_NATION_SLOTS(=16)！
+    //   relation_array 只有 7 条；越界后读到的是 Nation 的其它字段，
+    //   status 自检可能碰巧通过（11-14 实测 国8~国14 lv 出现 -37 这种垃圾值）。
+    for (int i = 1; i <= MAX_NATION_REAL; ++i) {
+        if (i == selfNo)
+            continue;
+
+        uint8_t* rel = nat + OFF_RELATION_ARRAY + (i - 1) * SIZEOF_NATION_RELATION;
+
+        // 布局自检：status 必须是合法 RELATION_*（0..4），否则偏移不对，绝不写
+        const unsigned char st = *reinterpret_cast<const unsigned char*>(rel + OFF_REL_STATUS);
+        if (st > 4)
+            continue;
+
+        signed char* lv = reinterpret_cast<signed char*>(rel + OFF_AI_RELATION_LEVEL);
+
+        // ★★★ 只在"原版可能宣战"的区间（lv < 10）才动作。
+        //   这是唯一的安全阀：若无条件写 10，会把 81 这种"很友好"砍成"濒临宣战"。
+        //   源码依据：oai_dipl.cpp  declare war if ai_relation_level==0 / >=10 则 continue；
+        //             oai_cap2.cpp  <10 就算不敌对也照打。
+        const int lvBefore = static_cast<int>(*lv);
+        if (lvBefore >= AI_REL_FRIENDLY)
+            continue;
+
+        const bool stronger = (cnt[i] >= mine * 2);
+        const bool blocked = stronger && (mode >= 2);
+
+        if (blocked)
+            *lv = AI_REL_FRIENDLY;        // ★ 生效：抬过门槛，原版就不打了
+
+        // 同一组合每 30 游戏日最多记一次，避免刷屏
+        if (lastLogDay[selfNo][i] == 0 || today - lastLogDay[selfNo][i] >= 30) {
+            lastLogDay[selfNo][i] = (today > 0) ? today : 1;
+            Log("[AI] 宣战带: 国%d(单位%d lv=%d) vs 国%d(单位%d) => %s\r\n",
+                selfNo, mine, lvBefore, i, cnt[i],
+                blocked ? "对手强2倍·拦截不宣战"
+                        : (stronger ? "该拦但mode<2" : "对手未达2倍·放行"));
+        }
+    }
+}
+
 // ★ 必须是 __fastcall：(ECX=this, EDX=x) 才能对上 __thiscall 的 Nation::process_ai。
 //   2026-10-17 曾误写成普通函数（__cdecl）⇒ self 取到栈上垃圾，
 //   读出的"vtable"其实是别的数据（含 "RESE_COM" 字符串），且可能拿垃圾指针调原函数。
@@ -602,6 +729,8 @@ static void __fastcall HookProcessAi(void* self, void* /*edx*/)
 {
     if (LooksLikeNation(self))          // ★ 身份校验：坏指针连 self 都不读
         LogNationVtableOnce(self);
+
+    ApplyWarGate(self);                 // ★ 2026-11-14：宣战军力门槛（aiwar，默认关）
 
     NeutralLairTick();                  // ★ E 刀：中立巢穴每日（30 秒节流）检查
 
